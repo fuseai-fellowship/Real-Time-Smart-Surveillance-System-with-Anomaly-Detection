@@ -272,3 +272,5 @@ venv/
 .vscode/
 __pycache__/
 *.pyc
+fusevenv/
+fusevenv/
