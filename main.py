@@ -371,13 +371,13 @@ class HumanAnomalyDetectionSystem:
 if __name__ == "__main__":
     # For webcam, use source=0
     # For video file, use source='path/to/video.mp4'
-    detector_system = HumanAnomalyDetectionSystem(source='/home/leapfrog/Downloads/fuse_machine_project/test.mp4')
+    # detector_system = HumanAnomalyDetectionSystem(source='/home/leapfrog/Downloads/fuse_machine_project/test.mp4')
     
     # Initialize system with webcam
-    # detector_system = HumanAnomalyDetectionSystem(
-    #     source=0,  # Change to video file path if needed
-    #     confidence_threshold=0.5
-    # )
+    detector_system = HumanAnomalyDetectionSystem(
+        source=0,  # Change to video file path if needed
+        confidence_threshold=0.5
+    )
     
     # Run the system
     detector_system.run()
