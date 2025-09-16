@@ -252,3 +252,23 @@ models/
 runs/
 *.mp4
 *.avi
+
+# Python venv
+fusevenv/
+venv/
+.env/
+
+# Model weights
+*.pt
+
+# Videos and datasets
+*.mp4
+*.avi
+*.mov
+*.csv
+*.xlsx
+
+# IDE
+.vscode/
+__pycache__/
+*.pyc
