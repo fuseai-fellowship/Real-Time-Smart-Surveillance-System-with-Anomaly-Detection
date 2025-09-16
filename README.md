@@ -56,11 +56,10 @@ Install the required Python packages:
 pip install -r requirements.txt
 ```
 
-### Usage
+## Usage
 
 To run the end-to-end prototype, you will need a video file for testing. The code is configured to use a video file named your_video.mp4 in the project directory.
-
-A recommended video dataset for testing this system is the UCSD Anomaly Detection Dataset, which contains videos of pedestrian walkways with naturally occurring anomalies.
+```bash
 
 Download a video clip you like to test or you can use the live video footage.
 
@@ -71,12 +70,12 @@ Rename the video file to your_video.mp4 or update the cv2.VideoCapture('your_vid
 Run the script from your terminal:
 
 python main.py
-
-
+```
 The system will open a video window displaying the real-time detection, tracking, and anomaly status for each person. Press q on your keyboard to exit the program.
 
-### Project Structure
 
+## Project Structure
+```bash
 main.py: The main script that runs the end-to-end prototype.
 
 requirements.txt: Lists all Python dependencies.
@@ -84,3 +83,4 @@ requirements.txt: Lists all Python dependencies.
 .gitignore: Specifies files to be ignored by Git.
 
 README.md: Project description and instructions.
+```
