@@ -392,8 +392,11 @@ def main():
         # Read and process video
         tfile = tempfile.NamedTemporaryFile(delete=False) 
         tfile.write(video_file.read())
-        cap = cv2.VideoCapture(tfile.name)
-        
+        # cap = cv2.VideoCapture(tfile.name)
+        # cap = cv2.VideoCapture("C:\Users\nisch\Documents\fuse_machine_2\Real-Time-Smart-Surveillance-System-with-Anomaly-Detection\Video\your_video.mp4")
+        cap = cv2.VideoCapture(r"C:\Users\nisch\Documents\fuse_machine_2\Real-Time-Smart-Surveillance-System-with-Anomaly-Detection\Video\your_video.mp4")
+
+        ##### i am notification here #####
         # Reset tracker for new video to ensure unique IDs
         tracker.reset()
         print("✓ SORT tracker reset for new video")
