@@ -11,6 +11,7 @@ import base64
 import tempfile
 import threading
 import queue
+import logging
 from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO, emit
 import cv2
@@ -22,6 +23,7 @@ import torch.nn as nn
 # Import our modules
 from models import init_models
 from sort import Sort
+from loitering import LoiterDetector
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -31,10 +33,22 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # Global variables for processing
 processing_queue = queue.Queue()
 is_processing = False
+# Use an Event to control pausing to avoid tight busy-wait loops
+pause_event = threading.Event()
 current_detector = None
 current_tracker = None
 yolo_model = None
 next_track_id = 1  # Global counter for unique track IDs
+# Loitering detector (lightweight, time + small movement)
+loiter_detector = LoiterDetector(loiter_seconds=10.0, min_disp_pixels=20.0, max_gap_seconds=1.0, fps=30)
+# Fall smoothing and bbox history to reduce false positives from ID switches
+FALL_VOTE_K = 5  # number of recent frames to consider for vote smoothing
+FALL_VOTE_THRESHOLD = 0.6  # fraction of votes required to accept model fall
+fall_vote_history = defaultdict(lambda: deque(maxlen=FALL_VOTE_K))
+bbox_history = defaultdict(lambda: deque(maxlen=6))  # keep recent bboxes per track for heuristics
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 # Model architecture (same as dashboard.py)
 class AttentionLayer(nn.Module):
@@ -137,11 +151,11 @@ class RealTimeAnomalyDetector:
         self.inference_times = []
         self.alerts = []
         
-        print(f"✓ Model loaded successfully")
-        print(f"  Device: {self.device}")
-        print(f"  Classes: {self.class_names}")
-        print(f"  Sequence length: {self.sequence_length}")
-        print(f"  Confidence threshold: {self.confidence_threshold}")
+        logging.info("✓ Model loaded successfully")
+        logging.info(f"  Device: {self.device}")
+        logging.info(f"  Classes: {self.class_names}")
+        logging.info(f"  Sequence length: {self.sequence_length}")
+        logging.info(f"  Confidence threshold: {self.confidence_threshold}")
     
     def extract_features(self, detection, track_id, frame_idx, frame_shape, roi_bounds=None):
         """
@@ -185,6 +199,24 @@ class RealTimeAnomalyDetector:
         else:
             dx, dy, speed, direction = 0, 0, 0, 0
         
+        # Detect sudden large normalized displacement (possible ID switch) and reset history
+        # Threshold is in normalized coordinates (0..1). Tune RESET_DISP_THRESHOLD as needed.
+        RESET_DISP_THRESHOLD = 0.45
+        if 'prev_center' in self.track_metadata[track_id]:
+            try:
+                if speed > RESET_DISP_THRESHOLD:
+                    # Clear track buffer to avoid mixing histories from ID switches
+                    try:
+                        self.track_buffers[track_id].clear()
+                    except Exception:
+                        self.track_buffers[track_id] = deque(maxlen=self.sequence_length)
+                    # Reset metadata for this track
+                    self.track_metadata[track_id] = {'prev_center': (center_x, center_y), 'first_seen': frame_idx}
+                    logging.info(f"Track {track_id}: large jump detected (disp={speed:.3f}) -> buffer reset")
+            except Exception:
+                # If anything goes wrong, ensure prev_center is updated below
+                pass
+
         # Update metadata
         self.track_metadata[track_id]['prev_center'] = (center_x, center_y)
         
@@ -258,7 +290,7 @@ class RealTimeAnomalyDetector:
                     
                     # Debug output to see what the model is predicting
                     if track_id % 10 == 0 or conf.item() > 0.3:  # Log every 10th track or high confidence
-                        print(f"Track {track_id}: {self.class_names[pred.item()]} ({conf.item():.3f})")
+                        logging.debug(f"Track {track_id}: {self.class_names[pred.item()]} ({conf.item():.3f})")
         
         # Record inference time
         inference_time = time.time() - start_time
@@ -317,17 +349,27 @@ def process_video_worker():
                 if current_tracker is None:
                     # Initialize SORT tracker with better parameters for tracking
                     current_tracker = Sort(max_age=30, min_hits=3, iou_threshold=0.3)
-                    print("✓ SORT tracker initialized with max_age=30, min_hits=3, iou_threshold=0.3")
+                    logging.info("✓ SORT tracker initialized with max_age=30, min_hits=3, iou_threshold=0.3")
+                    # Reset loiter detector state for new video
+                    loiter_detector.reset()
                 else:
                     # Reset existing tracker for new video
                     current_tracker.reset()
-                    print("✓ SORT tracker reset for new video")
+                    # Reset loiter detector together with tracker
+                    loiter_detector.reset()
+                    logging.info("✓ SORT tracker reset for new video")
                 
                 # Process video
                 cap = cv2.VideoCapture(video_path)
                 frame_count = 0
                 
                 while cap.isOpened() and is_processing:
+                    # If paused, wait using pause_event to avoid busy-wait
+                    while pause_event.is_set() and is_processing:
+                        # wait with timeout so we can respond to resume/stop
+                        pause_event.wait(0.1)
+                        continue
+                        
                     ret, frame = cap.read()
                     if not ret:
                         break
@@ -341,13 +383,13 @@ def process_video_worker():
                     detections = []
                     tracked_objects = np.empty((0, 5))
                     
-                    # Debug: Print YOLO results (every 10 frames to avoid spam)
+                    # Debug: Print YOLO results at debug level
                     if frame_count % 10 == 0:
-                        print(f"Frame {frame_count}: YOLO Results: {len(results)} result(s)")
+                        logging.debug(f"Frame {frame_count}: YOLO Results: {len(results)} result(s)")
                     
                     if len(results) > 0 and hasattr(results[0], 'boxes') and results[0].boxes is not None:
                         if frame_count % 10 == 0:
-                            print(f"Frame {frame_count}: Number of boxes detected: {len(results[0].boxes)}")
+                            logging.debug(f"Frame {frame_count}: Number of boxes detected: {len(results[0].boxes)}")
                         
                         if len(results[0].boxes) > 0:
                             boxes = results[0].boxes
@@ -363,30 +405,30 @@ def process_video_worker():
                                     if x1 >= 0 and y1 >= 0 and x2 > x1 and y2 > y1:
                                         detections_yolo.append(np.array([x1, y1, x2, y2, conf]))
                                         if frame_count % 10 == 0:
-                                            print(f"Frame {frame_count} Detection {i}: bbox=({x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}) conf={conf:.3f}")
+                                            logging.debug(f"Frame {frame_count} Detection {i}: bbox=({x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}) conf={conf:.3f}")
                                 except Exception as e:
-                                    print(f"Frame {frame_count} Error processing box {i}: {e}")
+                                    logging.exception(f"Frame {frame_count} Error processing box {i}")
                                     continue
                             
                             if len(detections_yolo) > 0:
                                 detections_yolo = np.stack(detections_yolo)
                                 if frame_count % 10 == 0:
-                                    print(f"Frame {frame_count}: Processing {len(detections_yolo)} valid detections")
+                                    logging.debug(f"Frame {frame_count}: Processing {len(detections_yolo)} valid detections")
                                 
                                 try:
                                     # Update SORT tracker
                                     tracked_objects = current_tracker.update(detections_yolo)
                                     if frame_count % 10 == 0:
-                                        print(f"Frame {frame_count}: Tracked objects shape: {tracked_objects.shape}")
+                                        logging.debug(f"Frame {frame_count}: Tracked objects shape: {tracked_objects.shape}")
                                         if len(tracked_objects) > 0:
-                                            print(f"Frame {frame_count}: Track IDs: {tracked_objects[:, 4] if len(tracked_objects.shape) > 1 else 'N/A'}")
-                                except Exception as e:
-                                    print(f"Frame {frame_count} Error in SORT tracking: {e}")
+                                            logging.debug(f"Frame {frame_count}: Track IDs: {tracked_objects[:, 4] if len(tracked_objects.shape) > 1 else 'N/A'}")
+                                except Exception:
+                                    logging.exception(f"Frame {frame_count} Error in SORT tracking")
                                     # Create fallback with proper track IDs
                                     tracked_objects = np.column_stack([detections_yolo, np.arange(len(detections_yolo)) + 1])
-                    else:
-                        if frame_count % 10 == 0:
-                            print(f"Frame {frame_count}: No valid boxes detected")
+                        else:
+                            if frame_count % 10 == 0:
+                                logging.debug(f"Frame {frame_count}: No valid boxes detected")
                     
                     # Convert tracked objects to detection format
                     for i, track in enumerate(tracked_objects):
@@ -403,7 +445,7 @@ def process_video_worker():
                                     'class': 'person'
                                 })
                                 if frame_count % 10 == 0:
-                                    print(f"Frame {frame_count} Added tracked detection {i}: track_id={int(track_id)}, bbox=({x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f})")
+                                    logging.debug(f"Frame {frame_count} Added tracked detection {i}: track_id={int(track_id)}, bbox=({x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f})")
                             elif len(track) >= 4:  # Fallback for raw detections without track_id
                                 x1, y1, x2, y2 = track[:4]
                                 # Only use fallback if SORT completely fails
@@ -415,33 +457,200 @@ def process_video_worker():
                                 })
                                 next_track_id += 1
                                 if frame_count % 10 == 0:
-                                    print(f"Frame {frame_count} Added fallback detection {i}: track_id={next_track_id-1}, bbox=({x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f})")
-                        except Exception as e:
-                            print(f"Frame {frame_count} Error processing track {i}: {e}")
+                                    logging.debug(f"Frame {frame_count} Added fallback detection {i}: track_id={next_track_id-1}, bbox=({x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f})")
+                        except Exception:
+                            logging.exception(f"Frame {frame_count} Error processing track {i}")
                             continue
                     
                     if frame_count % 10 == 0:
-                        print(f"Frame {frame_count}: Total detections processed: {len(detections)}")
+                        logging.debug(f"Frame {frame_count}: Total detections processed: {len(detections)}")
                     
                     # Get anomaly predictions (only if we have detections)
                     predictions = {}
+                    loitering_tracks = []
                     if detections:
+                        # First, update loiter detector state for each detection so it can track
+                        for det in detections:
+                            try:
+                                track_id = det['track_id']
+                                bbox = det['bbox']
+                                # keep bbox history for heuristics / debugging
+                                try:
+                                    bbox_history[track_id].append(bbox)
+                                except Exception:
+                                    bbox_history[track_id] = deque([bbox], maxlen=6)
+                                # update returns True when loitering threshold is reached this frame
+                                if loiter_detector.update(track_id, bbox, frame_count):
+                                    loitering_tracks.append(track_id)
+                            except Exception:
+                                logging.exception(f"Frame {frame_count} Error updating loiter detector for track {det.get('track_id')}")
+
                         try:
+                            # Map of track_id -> bbox for saving debug crops when alerts are generated
+                            track_bboxes = {det['track_id']: det['bbox'] for det in detections}
+
                             predictions = current_detector.process_frame(detections, frame_shape)
-                            
-                            # Add alerts for anomalies
+
+                            # Handle model-predicted anomalies with special smoothing for 'Fall'
                             for track_id, pred in predictions.items():
-                                if pred['class_name'] != 'Normal':
-                                    current_detector.add_alert(track_id, pred, current_detector.frame_count)
+                                try:
+                                    cls = pred.get('class_name', 'Normal')
+                                    conf = pred.get('confidence', 0.0)
+
+                                    # Maintain fall vote history for smoothing
+                                    if cls == 'Fall':
+                                        try:
+                                            fall_vote_history[track_id].append(1 if conf >= current_detector.confidence_threshold else 0)
+                                        except Exception:
+                                            fall_vote_history[track_id] = deque([1 if conf >= current_detector.confidence_threshold else 0], maxlen=FALL_VOTE_K)
+                                    else:
+                                        # push 0 for non-fall to keep window aligned
+                                        fall_vote_history[track_id].append(0)
+
+                                    # For non-fall anomalies, emit immediately if confident
+                                    if cls != 'Normal' and cls != 'Fall' and conf >= current_detector.confidence_threshold:
+                                        current_detector.add_alert(track_id, pred, current_detector.frame_count)
+                                        socketio.emit('alert', {
+                                            'track_id': track_id,
+                                            'class_name': cls,
+                                            'confidence': conf,
+                                            'timestamp': time.time()
+                                        })
+
+                                        # Save debug crop for inspection
+                                        try:
+                                            debug_dir = os.path.join(os.getcwd(), 'debug_alerts')
+                                            os.makedirs(debug_dir, exist_ok=True)
+                                            bbox = track_bboxes.get(track_id)
+                                            if bbox is not None:
+                                                x1, y1, x2, y2 = map(int, bbox)
+                                                h, w = frame.shape[:2]
+                                                x1, y1 = max(0, x1), max(0, y1)
+                                                x2, y2 = min(w-1, x2), min(h-1, y2)
+                                                crop = frame[y1:y2, x1:x2]
+                                                if crop.size != 0:
+                                                    fname = f"alert_track{track_id}_{cls}_f{frame_count}.jpg"
+                                                    cv2.imwrite(os.path.join(debug_dir, fname), crop)
+                                        except Exception:
+                                            logging.exception(f"Error saving debug crop for track {track_id}")
+                                except Exception:
+                                    logging.exception(f"Error handling prediction alert for track {track_id}")
+
+                            # Handle loitering alerts from the lightweight detector (override or augment predictions)
+                            for track_id in loitering_tracks:
+                                try:
+                                    # Create a loitering prediction object
+                                    loiter_pred = {
+                                        'class_id': None,
+                                        'confidence': 1.0,
+                                        'class_name': 'Loitering'
+                                    }
+                                    # Record in the model's alert list for visibility
+                                    current_detector.add_alert(track_id, loiter_pred, current_detector.frame_count)
+                                    # Update predictions so frontend sees loitering for this track
+                                    predictions[int(track_id)] = loiter_pred
                                     # Emit alert to frontend
                                     socketio.emit('alert', {
                                         'track_id': track_id,
-                                        'class_name': pred['class_name'],
-                                        'confidence': pred['confidence'],
+                                        'class_name': 'Loitering',
+                                        'confidence': 1.0,
                                         'timestamp': time.time()
                                     })
-                        except Exception as e:
-                            print(f"Error in anomaly detection: {e}")
+
+                                    # Save debug crop for loitering
+                                    try:
+                                        debug_dir = os.path.join(os.getcwd(), 'debug_alerts')
+                                        os.makedirs(debug_dir, exist_ok=True)
+                                        bbox = track_bboxes.get(track_id)
+                                        if bbox is not None:
+                                            x1, y1, x2, y2 = map(int, bbox)
+                                            h, w = frame.shape[:2]
+                                            x1, y1 = max(0, x1), max(0, y1)
+                                            x2, y2 = min(w-1, x2), min(h-1, y2)
+                                            crop = frame[y1:y2, x1:x2]
+                                            if crop.size != 0:
+                                                fname = f"loiter_track{track_id}_f{frame_count}.jpg"
+                                                cv2.imwrite(os.path.join(debug_dir, fname), crop)
+                                    except Exception:
+                                        logging.exception(f"Error saving debug crop for loitering track {track_id}")
+                                except Exception:
+                                    logging.exception(f"Frame {frame_count} Error handling loiter alert for track {track_id}")
+
+                            # Now evaluate fall detection using smoothed votes + simple bbox-based heuristic
+                            for track_id in list(fall_vote_history.keys()):
+                                try:
+                                    votes = list(fall_vote_history[track_id])
+                                    vote_frac = sum(votes) / len(votes) if votes else 0.0
+
+                                    # Simple bbox-based heuristic: large downward movement or height drop
+                                    heuristic_flag = False
+                                    bh = list(bbox_history.get(track_id, []))
+                                    if len(bh) >= 2:
+                                        # use last two bboxes
+                                        x1a, y1a, x2a, y2a = bh[-2]
+                                        x1b, y1b, x2b, y2b = bh[-1]
+                                        ha = (y2a - y1a)
+                                        hb = (y2b - y1b)
+                                        ca = (y1a + y2a) / 2.0
+                                        cb = (y1b + y2b) / 2.0
+                                        # normalized by frame height
+                                        frame_h = frame.shape[0]
+                                        # downward center movement (pixels -> normalized)
+                                        dy_norm = (cb - ca) / (frame_h + 1e-6)
+                                        # relative height change
+                                        if ha > 0:
+                                            height_drop = (ha - hb) / ha
+                                        else:
+                                            height_drop = 0
+
+                                        # Heuristic thresholds (tunable)
+                                        if dy_norm > 0.05 or height_drop > 0.25:
+                                            heuristic_flag = True
+
+                                    # Decide final fall detection: either strong vote or heuristic
+                                    fall_detected = False
+                                    if vote_frac >= FALL_VOTE_THRESHOLD:
+                                        fall_detected = True
+                                    elif heuristic_flag:
+                                        # if heuristic triggers, allow lower vote requirement
+                                        fall_detected = True
+
+                                    if fall_detected:
+                                        # emit fall alert (one-time per alerted status)
+                                        # avoid duplicate alerts: check current_detector.alerts
+                                        already_alerted = any(a['track_id'] == track_id and a['class_name'] == 'Fall' for a in current_detector.alerts)
+                                        if not already_alerted:
+                                            # Build synthetic prediction to record
+                                            fall_pred = {'class_id': None, 'confidence': max(0.5, vote_frac), 'class_name': 'Fall'}
+                                            current_detector.add_alert(track_id, fall_pred, current_detector.frame_count)
+                                            socketio.emit('alert', {
+                                                'track_id': track_id,
+                                                'class_name': 'Fall',
+                                                'confidence': fall_pred['confidence'],
+                                                'timestamp': time.time()
+                                            })
+
+                                            # Save debug crop for fall
+                                            try:
+                                                debug_dir = os.path.join(os.getcwd(), 'debug_alerts')
+                                                os.makedirs(debug_dir, exist_ok=True)
+                                                bbox = track_bboxes.get(track_id)
+                                                if bbox is not None:
+                                                    x1, y1, x2, y2 = map(int, bbox)
+                                                    h, w = frame.shape[:2]
+                                                    x1, y1 = max(0, x1), max(0, y1)
+                                                    x2, y2 = min(w-1, x2), min(h-1, y2)
+                                                    crop = frame[y1:y2, x1:x2]
+                                                    if crop.size != 0:
+                                                        fname = f"fall_track{track_id}_f{frame_count}.jpg"
+                                                        cv2.imwrite(os.path.join(debug_dir, fname), crop)
+                                            except Exception:
+                                                logging.exception(f"Error saving debug crop for fall track {track_id}")
+                                except Exception:
+                                    logging.exception(f"Error evaluating fall for track {track_id}")
+
+                        except Exception:
+                            logging.exception("Error in anomaly detection")
                             predictions = {}
                     
                     # Convert frame to base64 for frontend (resize for performance)
@@ -462,7 +671,10 @@ def process_video_worker():
                             for det in detections
                         ],
                         'processing_time': current_detector.inference_times[-1] if current_detector.inference_times else 0,
-                        'frame_count': frame_count
+                        'frame_count': frame_count,
+                        # include original and resized frame sizes so client can scale boxes correctly
+                        'orig_frame_size': {'width': frame.shape[1], 'height': frame.shape[0]},
+                        'resized_frame_size': {'width': 640, 'height': 360}
                     }
                     
                     # Emit to frontend every 3 frames to improve performance
@@ -484,7 +696,7 @@ def process_video_worker():
                 cap.release()
                 
             except Exception as e:
-                print(f"Error processing video: {e}")
+                logging.exception("Error processing video")
                 socketio.emit('error', {'message': str(e)})
             
             processing_queue.task_done()
@@ -528,6 +740,28 @@ def stop_processing():
     is_processing = False
     return jsonify({'success': True, 'message': 'Processing stopped'})
 
+@app.route('/pause_processing', methods=['POST'])
+def pause_processing():
+    try:
+        logging.info("Received pause request")
+        pause_event.set()
+        logging.info("Processing paused (pause_event set)")
+        return jsonify({'success': True, 'message': 'Processing paused'})
+    except Exception as e:
+        logging.exception("Error in pause_processing")
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/resume_processing', methods=['POST'])
+def resume_processing():
+    try:
+        logging.info("Received resume request")
+        pause_event.clear()
+        logging.info("Processing resumed (pause_event cleared)")
+        return jsonify({'success': True, 'message': 'Processing resumed'})
+    except Exception as e:
+        logging.exception("Error in resume_processing")
+        return jsonify({'success': False, 'message': str(e)})
+
 @app.route('/api/status')
 def get_status():
     return jsonify({
@@ -542,8 +776,8 @@ if __name__ == '__main__':
     # Move index.html to templates directory if it exists and templates/index.html doesn't
     if os.path.exists('index.html') and not os.path.exists('templates/index.html'):
         os.rename('index.html', 'templates/index.html')
-        print("✓ Moved index.html to templates directory")
+        logging.info("✓ Moved index.html to templates directory")
     
-    print("Starting Flask server...")
-    print("Dashboard will be available at: http://localhost:5000")
+    logging.info("Starting Flask server...")
+    logging.info("Dashboard will be available at: http://localhost:5000")
     socketio.run(app, debug=True, host='0.0.0.0', port=5000)
