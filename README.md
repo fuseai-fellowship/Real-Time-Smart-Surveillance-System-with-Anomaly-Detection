@@ -84,3 +84,9 @@ requirements.txt: Lists all Python dependencies.
 
 README.md: Project description and instructions.
 ```
+##Visuals
+![ROC Curve](roc curve.png)
+
+![Confusion Matrix](confusionmatrix.png)
+
+![Training Curve](trainingcurve.png)
